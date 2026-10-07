@@ -1,6 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 import { NextResponse } from 'next/server';
+import { createHash } from 'crypto';
 
 export const maxDuration = 60;
 
@@ -184,7 +185,33 @@ export async function POST(request) {
         );
       }
     }
+    // ---------- Guest-এর IP ভিত্তিক দৈনিক সীমা ----------
+    const GUEST_DAILY_LIMIT = 3;
+    let guestHash = null;
+    let guestUsed = 0;
 
+    if (!user) {
+      const ip =
+        request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+        request.headers.get('x-real-ip') ||
+        'unknown';
+      guestHash = createHash('sha256').update(ip + '|smart-vocab').digest('hex');
+
+      const { data: g } = await admin
+        .from('guest_usage')
+        .select('upload_count')
+        .eq('ip_hash', guestHash)
+        .eq('usage_date', today)
+        .maybeSingle();
+      guestUsed = g?.upload_count || 0;
+
+      if (guestUsed >= GUEST_DAILY_LIMIT) {
+        return NextResponse.json(
+          { error: `Guest হিসেবে আজকের সীমা (${GUEST_DAILY_LIMIT} বার) শেষ। বিনামূল্যে অ্যাকাউন্ট খুলে আরও ব্যবহার করুন।` },
+          { status: 429 }
+        );
+      }
+    }
     // ---------- ৩. শব্দ আলাদা করা + আগে পাওয়া শব্দ বাদ ----------
     const clipped = text.slice(0, user ? 100000 : 3000);
     const tokens = tokenize(clipped);
@@ -249,6 +276,12 @@ export async function POST(request) {
       };
       fresh.push(item);
       toInsert.push(item);
+    }
+        if (!user && guestHash) {
+      await admin.from('guest_usage').upsert(
+        { ip_hash: guestHash, usage_date: today, upload_count: guestUsed + 1 },
+        { onConflict: 'ip_hash,usage_date' }
+      );
     }
 
     // ---------- ৭. ডেটাবেসে সংরক্ষণ (শুধু লগইন করা user) ----------
