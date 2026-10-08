@@ -85,8 +85,14 @@ export async function POST(request) {
     }
 
     // প্ল্যান অনুযায়ী ফাইলের সাইজ সীমা
-    const { data: profile } = await admin.from('profiles').select('plan').eq('id', user.id).maybeSingle();
+    const { data: profile } = await admin.from('profiles').select('plan, is_blocked').eq('id', user.id).maybeSingle();
     const plan = profile?.plan || 'free';
+        if (profile?.is_blocked) {
+      return NextResponse.json(
+        { error: 'আপনার অ্যাকাউন্ট ব্লক করা হয়েছে। অ্যাডমিনের সাথে যোগাযোগ করুন।' },
+        { status: 403 }
+      );
+    }
     const { data: lim } = await admin.from('plan_limits').select('max_file_mb').eq('plan', plan).maybeSingle();
     const maxMb = lim?.max_file_mb ?? 5;
     if (file.size > maxMb * 1024 * 1024) {

@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useAuth } from '@/lib/useAuth';
 import { supabase } from '@/lib/supabase';
 
@@ -11,6 +11,26 @@ export default function Navbar() {
   const router = useRouter();
   const { user, loading } = useAuth();
   const [open, setOpen] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    if (!user) {
+      setIsAdmin(false);
+      return;
+    }
+    supabase
+      .from('profiles')
+      .select('role')
+      .eq('id', user.id)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (active) setIsAdmin(data?.role === 'admin');
+      });
+    return () => {
+      active = false;
+    };
+  }, [user]);
 
   const links = [
     { href: '/', label: 'হোম' },
@@ -21,6 +41,7 @@ export default function Navbar() {
           { href: '/dashboard', label: 'Dashboard' },
         ]
       : []),
+    ...(isAdmin ? [{ href: '/admin', label: '🛡️ অ্যাডমিন' }] : []),
   ];
 
   async function logout() {
