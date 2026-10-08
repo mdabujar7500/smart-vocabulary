@@ -5,10 +5,12 @@ import { createHash } from 'crypto';
 
 export const maxDuration = 60;
 
-const BATCH_SIZE = 40;      // প্রতিবার Gemini-কে কতটি শব্দ দেওয়া হবে
-const CONCURRENCY = 3;      // একসাথে কয়টি ভাগ চলবে
+const BATCH_SIZE = 40; // প্রতিবার Gemini-কে কতটি শব্দ দেওয়া হবে
+const CONCURRENCY = 3; // একসাথে কয়টি ভাগ চলবে
 const MAX_NEW_WORDS_USER = 1500;
 const MAX_NEW_WORDS_GUEST = 150;
+const TIME_BUDGET_MS = 50000; // এর মধ্যে কাজ শেষ করতে হবে (Vercel-এর সীমা ৬০ সেকেন্ড)
+const GUEST_DAILY_LIMIT = 3;
 
 // যেসব শব্দ বাদ যাবে: article, pronoun, basic preposition, be-forms
 const STOP = new Set(
@@ -40,8 +42,8 @@ function tokenize(text) {
   const seen = new Set();
   for (const m of matches) {
     let w = m.toLowerCase().replace(/’/g, "'");
-    if (/n't$/.test(w)) continue; // don't, isn't ইত্যাদি
-    w = w.split("'")[0];          // john's -> john
+    if (/n't$/.test(w)) continue;
+    w = w.split("'")[0];
     if (w.length < 2 || STOP.has(w) || seen.has(w)) continue;
     seen.add(w);
     out.push(w);
@@ -77,31 +79,54 @@ function isRetryable(err) {
     err?.status === 503 ||
     err?.status === 429 ||
     msg.includes('UNAVAILABLE') ||
-    msg.includes('high demand')
+    msg.includes('high demand') ||
+    msg.includes('timeout')
   );
 }
 
-async function askGemini(ai, prompt) {
+// একটি কল বেশি সময় আটকে থাকলে কেটে দেওয়া হয়
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const e = new Error('Gemini timeout');
+      e.status = 503;
+      reject(e);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function askGemini(ai, prompt, deadline) {
   let lastError;
   for (const model of getModelList()) {
     for (let attempt = 1; attempt <= 2; attempt++) {
+      const left = deadline - Date.now();
+      if (left < 4000) {
+        const e = lastError || new Error('time budget over');
+        e.status = 503;
+        throw e;
+      }
       try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: prompt,
-          config: { responseMimeType: 'application/json' },
-        });
+        const response = await withTimeout(
+          ai.models.generateContent({
+            model,
+            contents: prompt,
+            config: { responseMimeType: 'application/json' },
+          }),
+          Math.min(25000, left - 1000)
+        );
         const raw = (response.text || '').replace(/```json|```/g, '').trim();
         return JSON.parse(raw);
       } catch (err) {
         lastError = err;
         console.warn(`Gemini failed (model=${model}, attempt=${attempt}):`, err?.status || err?.message);
-        if (!isRetryable(err)) throw err;
-        await sleep(1500 * attempt);
+        if (!isRetryable(err) && !(err instanceof SyntaxError)) throw err;
+        await sleep(800 * attempt);
       }
     }
   }
-  throw lastError;
+  throw lastError || new Error('Gemini failed');
 }
 
 function buildPrompt(words) {
@@ -120,7 +145,7 @@ Return ONLY a JSON array. Each item must have exactly these fields:
 WORDS: ${words.join(', ')}`;
 }
 
-// অনেকগুলো ভাগ কয়েকটি করে একসাথে চালানো
+// ভাগগুলো কয়েকটি করে একসাথে চালানো; একটি ব্যর্থ হলে বাকিগুলো চলতে থাকে
 async function runInBatches(batches, worker) {
   const results = new Array(batches.length);
   let next = 0;
@@ -131,12 +156,13 @@ async function runInBatches(batches, worker) {
     }
   });
   await Promise.all(runners);
-  return results.flat();
+  return results;
 }
 
 const asArray = (v) => (Array.isArray(v) ? v.map(String) : []);
 
 export async function POST(request) {
+  const deadline = Date.now() + TIME_BUDGET_MS;
   try {
     const { text, fileName, fileType } = await request.json();
 
@@ -154,11 +180,11 @@ export async function POST(request) {
       const { data } = await admin.auth.getUser(token);
       user = data?.user || null;
     }
-        if (token && !user) {
+    if (token && !user) {
       return NextResponse.json({ error: 'আপনার লগইন সেশন শেষ। আবার লগইন করুন।' }, { status: 401 });
     }
 
-    // ---------- ২. প্ল্যান ও দৈনিক লিমিট ----------
+    // ---------- ২. প্ল্যান, ব্লক ও দৈনিক লিমিট ----------
     const today = new Date().toISOString().slice(0, 10);
     let plan = 'guest';
     let limit = null;
@@ -166,8 +192,14 @@ export async function POST(request) {
 
     if (user) {
       const { data: profile } = await admin
-        .from('profiles').select('plan').eq('id', user.id).maybeSingle();
+        .from('profiles').select('plan, is_blocked').eq('id', user.id).maybeSingle();
       plan = profile?.plan || 'free';
+      if (profile?.is_blocked) {
+        return NextResponse.json(
+          { error: 'আপনার অ্যাকাউন্ট ব্লক করা হয়েছে। অ্যাডমিনের সাথে যোগাযোগ করুন।' },
+          { status: 403 }
+        );
+      }
 
       const { data: lim } = await admin
         .from('plan_limits').select('daily_uploads').eq('plan', plan).maybeSingle();
@@ -185,8 +217,8 @@ export async function POST(request) {
         );
       }
     }
+
     // ---------- Guest-এর IP ভিত্তিক দৈনিক সীমা ----------
-    const GUEST_DAILY_LIMIT = 3;
     let guestHash = null;
     let guestUsed = 0;
 
@@ -212,6 +244,7 @@ export async function POST(request) {
         );
       }
     }
+
     // ---------- ৩. শব্দ আলাদা করা + আগে পাওয়া শব্দ বাদ ----------
     const clipped = text.slice(0, user ? 100000 : 3000);
     const tokens = tokenize(clipped);
@@ -234,19 +267,40 @@ export async function POST(request) {
 
     // ---------- ৫. বাকি শব্দ Gemini-তে (৪০টি করে ভাগে) ----------
     let geminiWords = [];
+    let failedBatches = 0;
+    let lastGeminiError = null;
+
     if (misses.length) {
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const raw = await runInBatches(chunk(misses, BATCH_SIZE), async (batch) => {
-        const result = await askGemini(ai, buildPrompt(batch));
-        return Array.isArray(result) ? result : [];
+      const results = await runInBatches(chunk(misses, BATCH_SIZE), async (batch) => {
+        if (Date.now() > deadline - 4000) return null; // সময় নেই, এই ভাগ পরের বারের জন্য থাকবে
+        try {
+          const result = await askGemini(ai, buildPrompt(batch), deadline);
+          return Array.isArray(result) ? result : [];
+        } catch (err) {
+          lastGeminiError = err;
+          console.error('batch failed:', err?.status || err?.message);
+          return null;
+        }
       });
-      geminiWords = raw;
+      for (const r of results) {
+        if (r === null) failedBatches++;
+        else geminiWords.push(...r);
+      }
+
+      // একটি শব্দও না এলে ব্যবহারকারীকে ত্রুটি দেখানো হবে (লিমিট কাটবে না)
+      if (geminiWords.length === 0 && dictHits.size === 0) {
+        const e = lastGeminiError || new Error('Gemini busy');
+        e.status = 503;
+        throw e;
+      }
     }
+    const incomplete = failedBatches > 0;
 
     // ---------- ৬. সব একত্র ও পরিষ্কার ----------
     const seen = new Set();
     const fresh = [];
-    const toInsert = []; // শুধু যেগুলো ডিকশনারিতে নতুন
+    const toInsert = [];
 
     for (const r of dictHits.values()) {
       if (seen.has(r.word)) continue;
@@ -277,11 +331,14 @@ export async function POST(request) {
       fresh.push(item);
       toInsert.push(item);
     }
-        if (!user && guestHash) {
-      await admin.from('guest_usage').upsert(
+
+    // ---------- Guest-এর ব্যবহার গণনা ----------
+    if (!user && guestHash) {
+      const { error: guestErr } = await admin.from('guest_usage').upsert(
         { ip_hash: guestHash, usage_date: today, upload_count: guestUsed + 1 },
         { onConflict: 'ip_hash,usage_date' }
       );
+      if (guestErr) console.error('guest_usage error:', guestErr);
     }
 
     // ---------- ৭. ডেটাবেসে সংরক্ষণ (শুধু লগইন করা user) ----------
@@ -302,6 +359,7 @@ export async function POST(request) {
           { onConflict: 'user_id,word_id', ignoreDuplicates: true }
         );
       }
+
       // ডকুমেন্ট ও তার শব্দের ইতিহাস সংরক্ষণ
       const { data: doc } = await admin
         .from('documents')
@@ -322,6 +380,7 @@ export async function POST(request) {
           );
         }
       }
+
       await admin.from('daily_usage').upsert(
         { user_id: user.id, usage_date: today, upload_count: usedToday + 1 },
         { onConflict: 'user_id,usage_date' }
@@ -332,6 +391,7 @@ export async function POST(request) {
       words: fresh,
       skipped,
       truncated,
+      incomplete,
       plan,
       remaining: plan === 'premium' || !user ? null : Math.max(limit - usedToday - 1, 0),
     });

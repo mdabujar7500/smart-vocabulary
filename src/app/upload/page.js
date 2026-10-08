@@ -88,7 +88,13 @@ export default function UploadPage() {
         },
         body: JSON.stringify({ text, fileName: fileName || 'Pasted text', fileType }),
       });
-      const data = await res.json();
+            const raw = await res.text();
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        throw new Error('সার্ভার এই মুহূর্তে সাড়া দিতে পারেনি। কয়েক সেকেন্ড পর আবার চেষ্টা করুন।');
+      }
       if (!res.ok) throw new Error(data.error || 'অজানা ত্রুটি');
 
       setWords(data.words);
@@ -97,6 +103,7 @@ export default function UploadPage() {
       const parts = [`নতুন শব্দ: ${data.words.length}টি`];
       if (data.skipped > 0) parts.push(`আগে পাওয়া বলে বাদ: ${data.skipped}টি`);
       if (data.truncated) parts.push('text অনেক বড় ছিল, বাকি শব্দের জন্য আবার বাটন চাপুন');
+            if (data.incomplete) parts.push('AI ব্যস্ত থাকায় কিছু শব্দ বাকি আছে, আবার বাটন চাপুন');
       if (token) {
         parts.push(data.plan === 'premium' ? 'Premium: আনলিমিটেড' : `আজ আর ${data.remaining} বার বাকি`);
       }
