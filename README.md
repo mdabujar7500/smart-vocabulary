@@ -36,7 +36,7 @@ Words are split by the server, already-known words are removed, words that exist
 
 ## Architecture
 
-!\[System architecture](docs/architecture.png)
+![System architecture](./docs/architecture.png)
 
 * **Frontend:** Next.js (React) with Tailwind CSS
 * **Backend:** Next.js API routes on Vercel. The Gemini API key and the Supabase service-role key exist only on the server.
@@ -44,7 +44,7 @@ Words are split by the server, already-known words are removed, words that exist
 
 ## Database
 
-!\[ER diagram](docs/er-diagram.png)
+![ER diagram](./docs/er-diagram.png)
 
 |Table|Purpose|
 |-|-|
